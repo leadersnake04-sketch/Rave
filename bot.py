@@ -629,4 +629,4 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 keep_alive()
-bot.run(os.getenv("MTUwODk4OTI2MjM1ODY0Mjc5OA.GpawBe.wnAxVA2gCLTFrS-gDqp3S1_NSKSfRNbYEvloHU"))
+bot.run(os.getenv("TOKEN"))
