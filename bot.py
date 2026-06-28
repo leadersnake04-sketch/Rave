@@ -206,7 +206,7 @@ async def get_player(interaction: discord.Interaction) -> wavelink.Player | None
 
     if not player:
         try:
-            player = await channel.connect(cls=wavelink.Player, deaf=True, timeout=60.0)
+            player = await channel.connect(cls=wavelink.Player, self_deaf=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Erreur connexion : `{e}`", ephemeral=True)
             return None
