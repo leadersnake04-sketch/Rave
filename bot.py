@@ -300,4 +300,4 @@ async def on_err(interaction: discord.Interaction, error):
 
 
 keep_alive()
-bot.run(os.getenv("MTUwODk4OTI2MjM1ODY0Mjc5OA.GzE2Yg.0MlGXhDPDYsGzOSm7ejL_pqMHrDu6iXjUI-6_E"))
+bot.run(os.getenv("TOKEN"))
