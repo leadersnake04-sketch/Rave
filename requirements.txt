@@ -1,3 +1,4 @@
-wavelink==3.5.2
+discord.py
+aiohttp
 flask
 python-dotenv

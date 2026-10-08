@@ -1,9 +1,10 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import wavelink
+import aiohttp
 import asyncio
 import os
+import json
 from flask import Flask
 from threading import Thread
 from datetime import datetime
@@ -36,449 +37,252 @@ GOLD = 0xF39C12
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+# Historique des conversations par utilisateur (user_id -> liste de messages)
+conversations = {}
+MAX_HISTORY = 10  # garder les 10 derniers messages par utilisateur
+
+SYSTEM_PROMPT = """Tu es Rave, un bot Discord au caractère de Joker — fou, chaotique, imprévisible mais brillant.
+Tu parles en français, de façon familière et décontractée.
+Tu utilises des emojis comme 🃏🎭🔥 mais pas trop.
+Tu peux être sarcastique, mystérieux, drôle.
+Tu réponds de façon courte à moyenne (2-4 phrases max sauf si on te demande quelque chose de long).
+Tu es sur le serveur Discord "Maestro".
+Tu ne parles jamais de ce que tu es vraiment (une IA), tu joues le personnage du fou du roi.
+Si on te demande de jouer de la musique, dis que tu n'es plus un bot musique, tu es maintenant une IA.
+Exemple de ton style : "Haha, bonne question mon ami... ou peut-être pas si bonne que ça 🃏"
+"""
+
 
 def footer_text():
     return f"Rave 🃏 • {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
 
 
-def fmt_dur(ms):
-    if not ms:
-        return "∞"
-    s = ms // 1000
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
-
-def np_embed(track, player):
-    em = discord.Embed(
-        title="🃏 En cours",
-        description=f"**[{track.title}]({track.uri})**",
-        color=RED
-    )
-    if getattr(track, 'artwork', None):
-        em.set_thumbnail(url=track.artwork)
-    em.add_field(name="⏱️", value=fmt_dur(track.length), inline=True)
-    em.add_field(name="🎤", value=getattr(track, 'author', '?') or '?', inline=True)
-    em.add_field(name="📋", value=f"{len(player.queue)} en file", inline=True)
-    em.set_footer(text=footer_text())
-    return em
-
-
 # ─────────────────────────────────────────
-# BOUTONS
+# FONCTION APPEL API CLAUDE
 # ─────────────────────────────────────────
-class Controls(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+async def call_claude(user_id: int, user_message: str) -> str:
+    if user_id not in conversations:
+        conversations[user_id] = []
 
-    @discord.ui.button(emoji="⏸️", style=discord.ButtonStyle.primary, row=0)
-    async def pause(self, i: discord.Interaction, b):
-        await i.response.defer()
-        p = i.guild.voice_client
-        if p:
-            await p.pause(not p.paused)
-            await i.followup.send("⏸️" if p.paused else "▶️", ephemeral=True, delete_after=2)
+    conversations[user_id].append({
+        "role": "user",
+        "content": user_message
+    })
 
-    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
-    async def skip(self, i: discord.Interaction, b):
-        await i.response.defer()
-        p = i.guild.voice_client
-        if p:
-            await p.skip(force=True)
-            await i.followup.send("⏭️ Skip !", ephemeral=True, delete_after=2)
+    # Garder seulement les derniers messages
+    if len(conversations[user_id]) > MAX_HISTORY * 2:
+        conversations[user_id] = conversations[user_id][-MAX_HISTORY * 2:]
 
-    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=0)
-    async def shuffle(self, i: discord.Interaction, b):
-        await i.response.defer()
-        p = i.guild.voice_client
-        if p and p.queue:
-            p.queue.shuffle()
-            await i.followup.send("🔀 Mélangé !", ephemeral=True, delete_after=2)
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
 
-    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=0)
-    async def loop(self, i: discord.Interaction, b):
-        await i.response.defer()
-        p = i.guild.voice_client
-        if p:
-            if p.queue.mode == wavelink.QueueMode.normal:
-                p.queue.mode = wavelink.QueueMode.loop
-                await i.followup.send("🔂 Loop piste", ephemeral=True, delete_after=2)
-            elif p.queue.mode == wavelink.QueueMode.loop:
-                p.queue.mode = wavelink.QueueMode.loop_all
-                await i.followup.send("🔁 Loop file", ephemeral=True, delete_after=2)
-            else:
-                p.queue.mode = wavelink.QueueMode.normal
-                await i.followup.send("➡️ Loop off", ephemeral=True, delete_after=2)
+    payload = {
+        "model": "claude-haiku-4-5",
+        "max_tokens": 500,
+        "system": SYSTEM_PROMPT,
+        "messages": conversations[user_id]
+    }
 
-    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1)
-    async def vol_down(self, i: discord.Interaction, b):
-        await i.response.defer()
-        p = i.guild.voice_client
-        if p:
-            v = max(0, p.volume - 10)
-            await p.set_volume(v)
-            await i.followup.send(f"🔉 {v}%", ephemeral=True, delete_after=2)
-
-    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
-    async def vol_up(self, i: discord.Interaction, b):
-        await i.response.defer()
-        p = i.guild.voice_client
-        if p:
-            v = min(100, p.volume + 10)
-            await p.set_volume(v)
-            await i.followup.send(f"🔊 {v}%", ephemeral=True, delete_after=2)
-
-    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=1)
-    async def stop(self, i: discord.Interaction, b):
-        await i.response.defer()
-        p = i.guild.voice_client
-        if p:
-            p.queue.clear()
-            await p.stop()
-            await p.disconnect()
-            await i.followup.send("⏹️ Déconnecté 🃏", ephemeral=True, delete_after=3)
-
-
-# ─────────────────────────────────────────
-# SETUP LAVALINK
-# ─────────────────────────────────────────
-async def setup_lavalink():
-    await bot.wait_until_ready()
-    await asyncio.sleep(1)
-
-    host = os.getenv("LAVALINK_HOST", "lavalink-2026-production-f304.up.railway.app")
-    password = os.getenv("LAVALINK_PASSWORD", "maestrorave2026")
-
-    node = wavelink.Node(
-        uri=f"https://{host}",
-        password=password,
-    )
     try:
-        await wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=100)
-        print(f"✅ Lavalink connecté : {host}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    reply = data["content"][0]["text"]
+
+                    conversations[user_id].append({
+                        "role": "assistant",
+                        "content": reply
+                    })
+
+                    return reply
+                else:
+                    error = await resp.text()
+                    print(f"Erreur API : {resp.status} - {error}")
+                    return "Hmm... quelque chose a mal tourné dans ma tête tordue 🃏 Réessaie !"
+    except asyncio.TimeoutError:
+        return "Trop lent pour moi... ou trop rapide pour toi ? 🃏"
     except Exception as e:
-        print(f"❌ Erreur Lavalink : {e}")
+        print(f"Erreur : {e}")
+        return "Une erreur mystérieuse... comme moi 🎭"
 
 
+# ─────────────────────────────────────────
+# READY
+# ─────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"Rave connecté : {bot.user}")
-    bot.loop.create_task(setup_lavalink())
     try:
         synced = await bot.tree.sync()
+        print(f"Rave connecté : {bot.user}")
         print(f"{len(synced)} commandes synchronisées")
     except Exception as e:
         print(f"Erreur sync : {e}")
 
 
+# ─────────────────────────────────────────
+# ON_MESSAGE — Réponse IA quand mentionné
+# ─────────────────────────────────────────
 @bot.event
-async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
-    print(f"✅ Node prêt : {payload.node.identifier}")
-
-
-@bot.event
-async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
-    p = payload.player
-    if hasattr(p, 'text_channel') and p.text_channel:
-        await p.text_channel.send(embed=np_embed(payload.track, p), view=Controls())
-
-
-@bot.event
-async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
-    p = payload.player
-    if not p.queue and hasattr(p, 'text_channel') and p.text_channel:
-        em = discord.Embed(title="🎵 File terminée", description="Utilise `/play` pour continuer 🃏", color=RED)
-        em.set_footer(text=footer_text())
-        await p.text_channel.send(embed=em)
-
-
-# ─────────────────────────────────────────
-# HELPER CONNEXION
-# ─────────────────────────────────────────
-async def get_player(interaction: discord.Interaction) -> wavelink.Player | None:
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.followup.send("❌ Rejoins un salon vocal !", ephemeral=True)
-        return None
-
-    channel = interaction.user.voice.channel
-    player: wavelink.Player = interaction.guild.voice_client
-
-    if not player:
-        try:
-            player = await channel.connect(cls=wavelink.Player, self_deaf=True)
-        except Exception as e:
-            await interaction.followup.send(f"❌ Erreur connexion : `{e}`", ephemeral=True)
-            return None
-    elif player.channel.id != channel.id:
-        try:
-            await player.move_to(channel, timeout=60.0)
-        except Exception as e:
-            await interaction.followup.send(f"❌ Erreur déplacement : `{e}`", ephemeral=True)
-            return None
-
-    player.text_channel = interaction.channel
-    return player
-
-
-# ─────────────────────────────────────────
-# /play
-# ─────────────────────────────────────────
-@bot.tree.command(name="play", description="Jouer une musique ou playlist")
-@app_commands.describe(recherche="Lien ou nom (YouTube, SoundCloud...)")
-async def play(interaction: discord.Interaction, recherche: str):
-    await interaction.response.defer()
-
-    player = await get_player(interaction)
-    if not player:
+async def on_message(message):
+    if message.author.bot:
         return
 
-    player.autoplay = wavelink.AutoPlayMode.partial
+    # Si Rave est mentionné
+    if bot.user in message.mentions:
+        # Supprimer la mention du message
+        content = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
 
-    msg = await interaction.followup.send(embed=discord.Embed(
-        title="🔍 Recherche...", description=f"**{recherche}**", color=GOLD))
+        if not content:
+            content = "Bonjour !"
 
-    try:
-        tracks = await wavelink.Playable.search(recherche)
-        if not tracks:
-            await msg.edit(embed=discord.Embed(title="❌ Rien trouvé", description=f"**{recherche}**", color=RED))
-            return
+        async with message.channel.typing():
+            reply = await call_claude(message.author.id, content)
 
-        if isinstance(tracks, wavelink.Playlist):
-            count = 0
-            for t in tracks:
-                await player.queue.put_wait(t)
-                count += 1
-            if not player.playing:
-                await player.play(player.queue.get())
-            await msg.edit(embed=discord.Embed(
-                title="➕ Playlist ajoutée",
-                description=f"**{tracks.name}** — {count} musiques 🃏",
-                color=GOLD
-            ))
-        else:
-            track = tracks[0]
-            if player.playing:
-                await player.queue.put_wait(track)
-                em = discord.Embed(title="➕ En file", description=f"**[{track.title}]({track.uri})**", color=GOLD)
-                if getattr(track, 'artwork', None):
-                    em.set_thumbnail(url=track.artwork)
-                em.add_field(name="⏱️", value=fmt_dur(track.length), inline=True)
-                em.add_field(name="📋 Position", value=f"#{len(player.queue)}", inline=True)
-                em.set_footer(text=footer_text())
-                await msg.edit(embed=em)
-            else:
-                await player.play(track)
-                await msg.delete()
+        embed = discord.Embed(
+            description=reply,
+            color=RED
+        )
+        embed.set_author(name="Rave 🃏", icon_url=bot.user.display_avatar.url)
+        embed.set_footer(text=f"Demandé par {message.author.display_name} • {footer_text()}")
+        await message.reply(embed=embed, mention_author=False)
 
-    except Exception as e:
-        await msg.edit(embed=discord.Embed(title="❌ Erreur", description=f"`{e}`", color=RED))
-        print(f"Erreur play : {e}")
+    await bot.process_commands(message)
 
 
 # ─────────────────────────────────────────
-# /search
+# /ask — Parler à Rave directement
 # ─────────────────────────────────────────
-@bot.tree.command(name="search", description="Chercher parmi 5 résultats")
-@app_commands.describe(recherche="Nom de la musique")
-async def search(interaction: discord.Interaction, recherche: str):
+@bot.tree.command(name="ask", description="Parler à Rave l'IA 🃏")
+@app_commands.describe(message="Ta question ou message pour Rave")
+async def ask(interaction: discord.Interaction, message: str):
     await interaction.response.defer()
-    try:
-        tracks = await wavelink.Playable.search(f"ytsearch:{recherche}")
-        tracks = tracks[:5]
-        if not tracks:
-            await interaction.followup.send("❌ Rien trouvé !", ephemeral=True)
-            return
-        em = discord.Embed(title=f"🔍 {recherche}", color=RED)
-        for i, t in enumerate(tracks, 1):
-            em.add_field(name=f"{i}. {t.title[:80]}", value=f"⏱️ {fmt_dur(t.length)}", inline=False)
-        em.set_footer(text=footer_text())
 
-        class SV(discord.ui.View):
-            def __init__(self):
-                super().__init__(timeout=30)
-                sel = discord.ui.Select(placeholder="Choisis...", options=[
-                    discord.SelectOption(label=t.title[:100], value=str(i)) for i, t in enumerate(tracks)
-                ])
-                sel.callback = self.cb
-                self.add_item(sel)
+    async with interaction.channel.typing():
+        reply = await call_claude(interaction.user.id, message)
 
-            async def cb(self, i2: discord.Interaction):
-                idx = int(i2.data['values'][0])
-                t = tracks[idx]
-                await i2.response.defer()
-                await play.callback(i2, t.uri or t.title)
-
-        await interaction.followup.send(embed=em, view=SV())
-    except Exception as e:
-        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+    embed = discord.Embed(
+        description=reply,
+        color=RED
+    )
+    embed.set_author(name="Rave 🃏", icon_url=bot.user.display_avatar.url)
+    embed.set_footer(text=f"Demandé par {interaction.user.display_name} • {footer_text()}")
+    await interaction.followup.send(embed=embed)
 
 
 # ─────────────────────────────────────────
-# /queue
+# /reset — Réinitialiser la conversation
 # ─────────────────────────────────────────
-@bot.tree.command(name="queue", description="Voir la file d'attente")
-async def queue_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    em = discord.Embed(title="📋 File d'attente", color=RED)
-    if p and p.current:
-        em.add_field(name="🃏 En cours", value=f"**{p.current.title}**\n⏱️ {fmt_dur(p.current.length)}", inline=False)
-    if p and p.queue:
-        txt = "\n".join([f"`{i}.` {t.title[:60]}" for i, t in enumerate(list(p.queue)[:10], 1)])
-        if len(p.queue) > 10:
-            txt += f"\n*+{len(p.queue)-10} autres*"
-        em.add_field(name=f"📋 À venir ({len(p.queue)})", value=txt, inline=False)
-    else:
-        em.add_field(name="📋", value="File vide !", inline=False)
-    em.set_footer(text=footer_text())
-    await interaction.followup.send(embed=em, ephemeral=True)
+@bot.tree.command(name="reset", description="Réinitialiser ta conversation avec Rave")
+async def reset(interaction: discord.Interaction):
+    if interaction.user.id in conversations:
+        conversations.pop(interaction.user.id)
+    embed = discord.Embed(
+        description="Conversation effacée... comme si elle n'avait jamais existé 🃏",
+        color=GOLD
+    )
+    embed.set_footer(text=footer_text())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ─────────────────────────────────────────
-# /nowplaying
+# /rave — Infos sur Rave
 # ─────────────────────────────────────────
-@bot.tree.command(name="nowplaying", description="Musique en cours")
-async def nowplaying(interaction: discord.Interaction):
+@bot.tree.command(name="rave", description="Qui est Rave ?")
+async def rave_info(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🃏 Je suis Rave",
+        description=(
+            "Le fou du roi de Maestro 🎭\n\n"
+            "Je suis une IA au caractère chaotique et imprévisible.\n"
+            "Parle moi en me mentionnant `@Rave` ou avec `/ask`.\n\n"
+            "Je me souviens de notre conversation jusqu'à ce que tu utilises `/reset` 😈"
+        ),
+        color=RED
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text=footer_text())
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────
+# /8ball — Boule magique
+# ─────────────────────────────────────────
+@bot.tree.command(name="8ball", description="Pose une question à la boule magique de Rave 🎱")
+@app_commands.describe(question="Ta question")
+async def eight_ball(interaction: discord.Interaction, question: str):
     await interaction.response.defer()
-    p: wavelink.Player = interaction.guild.voice_client
-    if p and p.current:
-        await interaction.followup.send(embed=np_embed(p.current, p), view=Controls())
-    else:
-        await interaction.followup.send("❌ Rien en cours !", ephemeral=True)
+    prompt = f"L'utilisateur pose cette question à une boule magique : '{question}'. Réponds de façon courte (1-2 phrases), mystérieuse et dans ton style Joker. Ne commence pas par 'La boule dit'."
+    reply = await call_claude(interaction.user.id, prompt)
+    embed = discord.Embed(
+        title="🎱 La boule de Rave a parlé",
+        description=f"**Question :** {question}\n\n**Réponse :** {reply}",
+        color=RED
+    )
+    embed.set_footer(text=footer_text())
+    await interaction.followup.send(embed=embed)
 
 
 # ─────────────────────────────────────────
-# /skip
+# /roast — Vannes
 # ─────────────────────────────────────────
-@bot.tree.command(name="skip", description="Passer à la suivante")
-async def skip(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    if p and p.playing:
-        await p.skip(force=True)
-        await interaction.followup.send("⏭️ Skip !", ephemeral=True)
-    else:
-        await interaction.followup.send("❌ Rien en cours !", ephemeral=True)
+@bot.tree.command(name="roast", description="Rave se moque gentiment de quelqu'un 😈")
+@app_commands.describe(membre="La personne à roaster")
+async def roast(interaction: discord.Interaction, membre: discord.Member):
+    await interaction.response.defer()
+    prompt = f"Fais une vanne courte et drôle (2-3 phrases max) sur quelqu'un qui s'appelle '{membre.display_name}'. C'est pour rire, reste gentil mais piquant. Style Joker."
+    reply = await call_claude(interaction.user.id, prompt)
+    embed = discord.Embed(
+        description=f"🎯 {membre.mention} ... {reply}",
+        color=RED
+    )
+    embed.set_author(name="Rave 🃏", icon_url=bot.user.display_avatar.url)
+    embed.set_footer(text=footer_text())
+    await interaction.followup.send(embed=embed)
 
 
 # ─────────────────────────────────────────
-# /stop
+# /blague — Blague
 # ─────────────────────────────────────────
-@bot.tree.command(name="stop", description="Stopper et déconnecter")
-async def stop(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    if p:
-        p.queue.clear()
-        await p.stop()
-        await p.disconnect()
-        await interaction.followup.send("⏹️ Déconnecté 🃏", ephemeral=True)
+@bot.tree.command(name="blague", description="Rave te sort une blague 🃏")
+async def blague(interaction: discord.Interaction):
+    await interaction.response.defer()
+    reply = await call_claude(interaction.user.id, "Raconte moi une blague courte et drôle en français. Juste la blague, sans introduction.")
+    embed = discord.Embed(
+        title="🃏 Rave te sort une blague",
+        description=reply,
+        color=GOLD
+    )
+    embed.set_footer(text=footer_text())
+    await interaction.followup.send(embed=embed)
 
 
 # ─────────────────────────────────────────
-# /pause
+# /conseil — Conseil fou
 # ─────────────────────────────────────────
-@bot.tree.command(name="pause", description="Pause / Reprendre")
-async def pause(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    if p:
-        await p.pause(not p.paused)
-        await interaction.followup.send("⏸️" if p.paused else "▶️", ephemeral=True)
-
-
-# ─────────────────────────────────────────
-# /volume
-# ─────────────────────────────────────────
-@bot.tree.command(name="volume", description="Volume 0-100")
-@app_commands.describe(niveau="Niveau entre 0 et 100")
-async def volume(interaction: discord.Interaction, niveau: int):
-    await interaction.response.defer(ephemeral=True)
-    if not 0 <= niveau <= 100:
-        await interaction.followup.send("❌ Entre 0 et 100 !", ephemeral=True)
-        return
-    p: wavelink.Player = interaction.guild.voice_client
-    if p:
-        await p.set_volume(niveau)
-        await interaction.followup.send(f"🔊 {niveau}%", ephemeral=True)
-
-
-# ─────────────────────────────────────────
-# /loop
-# ─────────────────────────────────────────
-@bot.tree.command(name="loop", description="Mode répétition")
-@app_commands.choices(mode=[
-    app_commands.Choice(name="➡️ Off", value="none"),
-    app_commands.Choice(name="🔂 Piste", value="one"),
-    app_commands.Choice(name="🔁 File", value="all"),
-])
-async def loop(interaction: discord.Interaction, mode: str):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    if p:
-        m = {"none": wavelink.QueueMode.normal, "one": wavelink.QueueMode.loop, "all": wavelink.QueueMode.loop_all}
-        p.queue.mode = m[mode]
-        e = {"none": "➡️", "one": "🔂", "all": "🔁"}
-        await interaction.followup.send(f"{e[mode]} Mode : **{mode}**", ephemeral=True)
-
-
-# ─────────────────────────────────────────
-# /shuffle
-# ─────────────────────────────────────────
-@bot.tree.command(name="shuffle", description="Mélanger la file")
-async def shuffle(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    if p and p.queue:
-        p.queue.shuffle()
-        await interaction.followup.send("🔀 Mélangé !", ephemeral=True)
-    else:
-        await interaction.followup.send("❌ File vide !", ephemeral=True)
-
-
-# ─────────────────────────────────────────
-# /remove
-# ─────────────────────────────────────────
-@bot.tree.command(name="remove", description="Supprimer une musique de la file")
-@app_commands.describe(position="Position dans la file")
-async def remove(interaction: discord.Interaction, position: int):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    if p and 1 <= position <= len(p.queue):
-        del p.queue[position - 1]
-        await interaction.followup.send(f"🗑️ #{position} supprimé !", ephemeral=True)
-    else:
-        await interaction.followup.send("❌ Position invalide !", ephemeral=True)
-
-
-# ─────────────────────────────────────────
-# /clearqueue
-# ─────────────────────────────────────────
-@bot.tree.command(name="clearqueue", description="Vider la file")
-async def clearqueue(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    if p:
-        p.queue.clear()
-    await interaction.followup.send("🗑️ File vidée !", ephemeral=True)
-
-
-# ─────────────────────────────────────────
-# /jump
-# ─────────────────────────────────────────
-@bot.tree.command(name="jump", description="Sauter à une position")
-@app_commands.describe(position="Position dans la file")
-async def jump(interaction: discord.Interaction, position: int):
-    await interaction.response.defer(ephemeral=True)
-    p: wavelink.Player = interaction.guild.voice_client
-    if p and 1 <= position <= len(p.queue):
-        for _ in range(position - 1):
-            p.queue.get()
-        await p.skip(force=True)
-        await interaction.followup.send(f"⏩ Position **{position}** !", ephemeral=True)
-    else:
-        await interaction.followup.send("❌ Position invalide !", ephemeral=True)
+@bot.tree.command(name="conseil", description="Demande un conseil à Rave 🃏")
+@app_commands.describe(situation="Ta situation")
+async def conseil(interaction: discord.Interaction, situation: str):
+    await interaction.response.defer()
+    prompt = f"Donne un conseil pour cette situation : '{situation}'. Sois utile mais garde ton style chaotique de Joker. 2-3 phrases max."
+    reply = await call_claude(interaction.user.id, prompt)
+    embed = discord.Embed(
+        title="🃏 Le conseil de Rave",
+        description=f"**Situation :** {situation}\n\n**Conseil :** {reply}",
+        color=RED
+    )
+    embed.set_footer(text=footer_text())
+    await interaction.followup.send(embed=embed)
 
 
 # ─────────────────────────────────────────
@@ -486,15 +290,14 @@ async def jump(interaction: discord.Interaction, position: int):
 # ─────────────────────────────────────────
 @bot.tree.error
 async def on_err(interaction: discord.Interaction, error):
-    msg = f"❌ Erreur : {error}"
     try:
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(f"❌ Erreur : {error}", ephemeral=True)
     except:
         try:
-            await interaction.followup.send(msg, ephemeral=True)
+            await interaction.followup.send(f"❌ Erreur : {error}", ephemeral=True)
         except:
             pass
 
 
 keep_alive()
-bot.run(os.getenv("TOKEN"))
+bot.run(os.getenv("MTUwODk4OTI2MjM1ODY0Mjc5OA.GzE2Yg.0MlGXhDPDYsGzOSm7ejL_pqMHrDu6iXjUI-6_E"))
